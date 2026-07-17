@@ -4,7 +4,6 @@
 Streamlit UI for Editorial Pose Transformation Pipeline.
 
 Run:
-  set REPLICATE_API_TOKEN=r8_...
   streamlit run streamlit_app.py
 """
 
@@ -20,19 +19,11 @@ from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv(Path(__file__).resolve().parent / ".env")
-except ImportError:
-    pass
-
 from pose_transform_gemini import (
     DEFAULT_MAX_WORKERS,
     DEFAULT_UPSCALE_WORKERS,
     PIPELINE_MODES,
     EditorialPoseTransformer,
-    get_replicate_api_key,
     output_folder_for_mode,
 )
 
@@ -163,6 +154,7 @@ def run_pipeline(
     donor_paths: Optional[List[Path]],
     embed_metadata: bool,
     max_workers: int,
+    replicate_api_key: str,
 ) -> Dict:
     input_dir, donor_dir, output_dir = _new_run_dirs(mode)
 
@@ -178,6 +170,7 @@ def run_pipeline(
         donor_folder = str(donor_dir)
 
     transformer = EditorialPoseTransformer(
+        replicate_api_key=replicate_api_key,
         mode=mode,
         max_workers=max_workers,
         embed_metadata=embed_metadata,
@@ -227,15 +220,18 @@ def main() -> None:
     st.title("Editorial Pose Transform")
     st.caption("Gemini 3 Flash + Nano Banana 2 via Replicate — single image or batch.")
 
-    api_key = get_replicate_api_key()
     with st.sidebar:
         st.header("Settings")
+        api_key = st.text_input(
+            "Replicate API key",
+            type="password",
+            placeholder="r8_...",
+            help="Paste your Replicate API token. It is used for this session only.",
+        ).strip()
         if api_key:
-            st.success("Replicate key loaded from env")
-            st.caption("REPLICATE_API_TOKEN / REPLICATE_API_KEY")
+            st.success("API key entered")
         else:
-            st.error("Missing Replicate API key")
-            st.caption("Set REPLICATE_API_TOKEN or REPLICATE_API_KEY, then restart Streamlit.")
+            st.warning("Enter your Replicate API key to run")
 
         mode = st.selectbox(
             "Pipeline mode",
@@ -266,7 +262,7 @@ def main() -> None:
         )
 
     if not api_key:
-        st.warning("Configure REPLICATE_API_TOKEN in the environment before running.")
+        st.info("Enter your Replicate API key in the sidebar to get started.")
         return
 
     needs_donors = _needs_donors(mode)
@@ -312,6 +308,7 @@ def main() -> None:
                             donor_paths=donors,
                             embed_metadata=embed_metadata,
                             max_workers=1,
+                            replicate_api_key=api_key,
                         )
                     except Exception as exc:
                         st.exception(exc)
@@ -369,6 +366,7 @@ def main() -> None:
                             donor_paths=donors,
                             embed_metadata=embed_metadata,
                             max_workers=max_workers,
+                            replicate_api_key=api_key,
                         )
                         progress.progress(1.0, text="Batch complete")
                     except Exception as exc:
