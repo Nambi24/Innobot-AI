@@ -34,8 +34,8 @@ RUNS_DIR = SCRIPT_DIR / "runs"
 IMAGE_TYPES = ["jpg", "jpeg", "png", "bmp", "tiff", "webp"]
 IMAGE_EXTENSIONS = {f".{ext}" for ext in IMAGE_TYPES}
 
-# Streamlit Cloud upload cap is 200 MB per file; batches run sequentially to avoid timeouts.
-MAX_ZIP_UPLOAD_BYTES = 200 * 1024 * 1024
+# Streamlit default upload cap is 200 MB; raised via .streamlit/config.toml.
+MAX_ZIP_UPLOAD_BYTES = 1024 * 1024 * 1024
 RECOMMENDED_MAX_BATCH_IMAGES = 30
 HARD_MAX_BATCH_IMAGES = 100
 
@@ -472,9 +472,14 @@ def main() -> None:
             st.markdown(
                 f"""
 **Upload**
-- Max ZIP size: **200 MB** (Streamlit upload limit)
+- Max ZIP size: **1 GB** (via `.streamlit/config.toml`)
 - Recommended: **≤ {RECOMMENDED_MAX_BATCH_IMAGES} images** per batch on Streamlit Cloud
 - Hard cap in this app: **{HARD_MAX_BATCH_IMAGES} images** per ZIP
+
+**If a ZIP is still too large**
+- Split into multiple ZIPs of ~15–20 images
+- Re-compress photos (JPEG quality ~85) before zipping
+- Prefer ZIP over raw multi-upload — nested folders are supported
 
 **Timing (approx., one-by-one)**
 - Mode 1 (upscale): ~1–2 min / image
@@ -513,7 +518,7 @@ def main() -> None:
             zip_size = len(subject_zip.getvalue())
             st.caption(f"ZIP size: {zip_size / (1024 * 1024):.1f} MB")
             if zip_size > MAX_ZIP_UPLOAD_BYTES:
-                st.error("ZIP exceeds the 200 MB upload limit.")
+                st.error("ZIP exceeds the 1 GB upload limit. Split into smaller ZIPs.")
             else:
                 with tempfile.TemporaryDirectory() as preview_tmp:
                     try:
@@ -543,7 +548,7 @@ def main() -> None:
         if run and subject_zip is not None:
             zip_bytes = subject_zip.getvalue()
             if len(zip_bytes) > MAX_ZIP_UPLOAD_BYTES:
-                st.error("ZIP exceeds the 200 MB upload limit.")
+                st.error("ZIP exceeds the 1 GB upload limit. Split into smaller ZIPs.")
                 return
 
             with tempfile.TemporaryDirectory() as tmp:
@@ -563,7 +568,7 @@ def main() -> None:
                         return
                     donor_bytes = donor_zip.getvalue()
                     if len(donor_bytes) > MAX_ZIP_UPLOAD_BYTES:
-                        st.error("Donor ZIP exceeds the 200 MB upload limit.")
+                        st.error("Donor ZIP exceeds the 1 GB upload limit. Split into smaller ZIPs.")
                         return
                     try:
                         donors = _extract_images_from_zip(donor_bytes, tmp_path / "donors")

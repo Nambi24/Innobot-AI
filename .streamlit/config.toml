@@ -1,0 +1,7 @@
+[server]
+# Default is 200 MB. Raise so larger batch ZIPs can upload.
+# Values are in megabytes.
+maxUploadSize = 1024
+
+[browser]
+gatherUsageStats = false
