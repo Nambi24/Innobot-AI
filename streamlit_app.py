@@ -5,7 +5,7 @@ Streamlit UI for Editorial Pose Transformation Pipeline.
 
 Run:
   set REPLICATE_API_TOKEN=r8_...
-  streamlit run app.py
+  streamlit run streamlit_app.py
 """
 
 from __future__ import annotations
