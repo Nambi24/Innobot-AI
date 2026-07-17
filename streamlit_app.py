@@ -10,6 +10,7 @@ Run:
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import tempfile
 import uuid
@@ -24,12 +25,19 @@ from pose_transform_gemini import (
     DEFAULT_UPSCALE_WORKERS,
     PIPELINE_MODES,
     EditorialPoseTransformer,
+    build_donor_pairs,
     output_folder_for_mode,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUNS_DIR = SCRIPT_DIR / "runs"
 IMAGE_TYPES = ["jpg", "jpeg", "png", "bmp", "tiff", "webp"]
+IMAGE_EXTENSIONS = {f".{ext}" for ext in IMAGE_TYPES}
+
+# Streamlit Cloud upload cap is 200 MB per file; batches run sequentially to avoid timeouts.
+MAX_ZIP_UPLOAD_BYTES = 200 * 1024 * 1024
+RECOMMENDED_MAX_BATCH_IMAGES = 30
+HARD_MAX_BATCH_IMAGES = 100
 
 MODE_LABELS = {
     "upscale": "1 · Upscale (4K → *_1.jpg)",
@@ -63,6 +71,85 @@ def _safe_filename(name: str) -> str:
     suffix = Path(name).suffix.lower() or ".jpg"
     cleaned = "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)
     return f"{cleaned or 'image'}{suffix}"
+
+
+def _is_image_path(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def _find_images_recursive(root: Path) -> List[Path]:
+    """Resolve all images under root, including nested subfolders."""
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.rglob("*") if _is_image_path(p))
+
+
+def _safe_zip_member_path(name: str) -> Optional[str]:
+    """Normalize ZIP entry paths and block path traversal."""
+    normalized = Path(name.replace("\\", "/"))
+    parts = [part for part in normalized.parts if part not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    if parts[0] == "__MACOSX":
+        return None
+    if any(part.startswith("._") for part in parts):
+        return None
+    return str(Path(*parts))
+
+
+def _extract_images_from_zip(zip_bytes: bytes, dest: Path) -> List[Path]:
+    """
+    Extract image files from a ZIP, preserving subfolder layout.
+
+    Works with archives like:
+      input/alice.jpg
+      input/set01/bob.png
+      photos/2024/march/charlie.webp
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    extracted = 0
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+
+            member = _safe_zip_member_path(info.filename)
+            if not member:
+                continue
+
+            member_path = Path(member)
+            if member_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+
+            target = dest / member_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(zf.read(info))
+            extracted += 1
+
+    images = _find_images_recursive(dest)
+    if extracted == 0:
+        raise ValueError("ZIP contains no supported image files (.jpg, .jpeg, .png, .bmp, .tiff, .webp).")
+    if not images:
+        raise ValueError("ZIP extracted files, but no readable images were found.")
+    return images
+
+
+def _validate_batch_size(count: int) -> None:
+    if count <= 0:
+        raise ValueError("No images found to process.")
+    if count > HARD_MAX_BATCH_IMAGES:
+        raise ValueError(
+            f"Batch has {count} images — hard limit is {HARD_MAX_BATCH_IMAGES}. "
+            "Split the ZIP into smaller batches."
+        )
+
+
+def _relative_display_path(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _save_uploads(files, dest: Path) -> List[Path]:
@@ -120,7 +207,7 @@ def _show_result_gallery(items: List[Dict]) -> None:
         return
 
     for item in items:
-        name = Path(item.get("input_image", "image")).name
+        name = item.get("input_display") or Path(item.get("input_image", "image")).name
         ok = item.get("success")
         skipped = item.get("skipped")
         status = "skipped" if skipped else ("ok" if ok else "failed")
@@ -145,6 +232,63 @@ def _show_result_gallery(items: List[Dict]) -> None:
                         key=f"dl_{path}",
                     )
         st.divider()
+
+
+def run_pipeline_sequential(
+    *,
+    mode: str,
+    input_paths: List[Path],
+    donor_paths: Optional[List[Path]],
+    embed_metadata: bool,
+    replicate_api_key: str,
+    progress_callback=None,
+) -> Dict:
+    """Process images one by one (batch ZIP mode)."""
+    _, _, output_dir = _new_run_dirs(mode)
+    os.makedirs(output_dir, exist_ok=True)
+
+    donor_pair_map: Dict[str, Dict[str, Optional[str]]] = {}
+    if _needs_donors(mode):
+        if not donor_paths or len(donor_paths) < 2:
+            raise ValueError("Modes 3/4 need at least 2 donor images (BG + pose).")
+        donor_pair_map = build_donor_pairs(
+            [str(path) for path in input_paths],
+            [str(path) for path in donor_paths],
+        )
+
+    transformer = EditorialPoseTransformer(
+        replicate_api_key=replicate_api_key,
+        mode=mode,
+        max_workers=1,
+        embed_metadata=embed_metadata,
+    )
+
+    items: List[Dict] = []
+    total = len(input_paths)
+    for index, path in enumerate(input_paths, start=1):
+        if progress_callback:
+            progress_callback(index, total, path)
+        pair = donor_pair_map.get(str(path), {})
+        item = transformer.process_image(
+            str(path),
+            str(output_dir),
+            bg_source=pair.get("bg_source"),
+            pose_source=pair.get("pose_source"),
+        )
+        item["input_display"] = path.name
+        items.append(item)
+
+    if mode in ("pose", "upscale_pose_bg", "both", "upscale_pose"):
+        transformer.save_descriptions_json(str(output_dir), items)
+
+    success = sum(1 for item in items if item.get("success"))
+    return {
+        "total": total,
+        "success": success,
+        "failed": total - success,
+        "items": items,
+        "output_folder": str(output_dir),
+    }
 
 
 def run_pipeline(
@@ -246,19 +390,21 @@ def main() -> None:
             "Embed camera EXIF (Nikon D7500-style)",
             value=False,
         )
+
+        run_style = st.radio(
+            "Run style",
+            options=("single", "batch"),
+            format_func=lambda x: "Single image" if x == "single" else "Batch (ZIP)",
+            horizontal=True,
+        )
+
         max_workers = st.slider(
             "Max parallel workers",
             min_value=1,
             max_value=40,
             value=min(8, _default_workers(mode)),
-            help="Lower this if you hit Replicate rate limits.",
-        )
-
-        run_style = st.radio(
-            "Run style",
-            options=("single", "batch"),
-            format_func=lambda x: "Single image" if x == "single" else "Batch (many images)",
-            horizontal=True,
+            help="Used for single-image runs only. Batch ZIP always runs one image at a time.",
+            disabled=run_style == "batch",
         )
 
     if not api_key:
@@ -317,60 +463,140 @@ def main() -> None:
                 st.session_state["last_results"] = results
 
     else:
-        st.subheader("Batch")
-        subjects = st.file_uploader(
-            "Subject images",
-            type=IMAGE_TYPES,
-            accept_multiple_files=True,
-            key="batch_subjects",
+        st.subheader("Batch (ZIP)")
+        st.caption(
+            "Upload a ZIP of subject images. Nested folders are supported "
+            "(e.g. `input/set01/photo.jpg`). Images are processed **one by one**."
         )
-        donor_files = None
-        if needs_donors:
-            st.markdown("**Donor images** (shared pool — at least 2; ideally 2× subject count)")
-            donor_files = st.file_uploader(
-                "Donors",
-                type=IMAGE_TYPES,
-                accept_multiple_files=True,
-                key="batch_donors",
+        with st.expander("Batch limits & what to expect"):
+            st.markdown(
+                f"""
+**Upload**
+- Max ZIP size: **200 MB** (Streamlit upload limit)
+- Recommended: **≤ {RECOMMENDED_MAX_BATCH_IMAGES} images** per batch on Streamlit Cloud
+- Hard cap in this app: **{HARD_MAX_BATCH_IMAGES} images** per ZIP
+
+**Timing (approx., one-by-one)**
+- Mode 1 (upscale): ~1–2 min / image
+- Mode 2 (pose): ~2–4 min / image
+- Modes 3–5 (two outputs): ~4–8 min / image
+
+**Practical max without breaking**
+- **Streamlit Cloud free**: stay around **10–20 images** (session can time out on long runs)
+- **Streamlit Cloud paid / local**: **30–50 images** is usually safe if you keep the tab open
+- **100 images** is the app hard limit; beyond that, split into multiple ZIPs
+
+**Replicate**
+- Pipeline allows up to **40 parallel** API calls, but batch ZIP runs sequentially to stay stable
+- Large batches mainly hit **time limits**, not Replicate rate limits
+                """
             )
 
-        if subjects:
-            st.caption(f"{len(subjects)} subject image(s) selected")
-            preview_cols = st.columns(min(4, len(subjects)))
-            for col, uploaded in zip(preview_cols, subjects[:4]):
-                with col:
-                    st.image(uploaded, caption=uploaded.name, use_container_width=True)
+        subject_zip = st.file_uploader(
+            "Subject images ZIP",
+            type=["zip"],
+            accept_multiple_files=False,
+            key="batch_subject_zip",
+        )
+        donor_zip = None
+        if needs_donors:
+            st.markdown("**Donor images ZIP** (BG + pose pool — at least 2 images; nested folders OK)")
+            donor_zip = st.file_uploader(
+                "Donor images ZIP",
+                type=["zip"],
+                accept_multiple_files=False,
+                key="batch_donor_zip",
+            )
+
+        preview_paths: List[Path] = []
+        if subject_zip is not None:
+            zip_size = len(subject_zip.getvalue())
+            st.caption(f"ZIP size: {zip_size / (1024 * 1024):.1f} MB")
+            if zip_size > MAX_ZIP_UPLOAD_BYTES:
+                st.error("ZIP exceeds the 200 MB upload limit.")
+            else:
+                with tempfile.TemporaryDirectory() as preview_tmp:
+                    try:
+                        preview_paths = _extract_images_from_zip(
+                            subject_zip.getvalue(),
+                            Path(preview_tmp) / "preview",
+                        )
+                        st.success(f"Found **{len(preview_paths)}** image(s) in ZIP (including subfolders).")
+                        if len(preview_paths) > RECOMMENDED_MAX_BATCH_IMAGES:
+                            st.warning(
+                                f"{len(preview_paths)} images is above the recommended "
+                                f"{RECOMMENDED_MAX_BATCH_IMAGES}. The run may time out on Streamlit Cloud."
+                            )
+                        preview_lines = [
+                            _relative_display_path(path, Path(preview_tmp) / "preview")
+                            for path in preview_paths[:12]
+                        ]
+                        st.code("\n".join(preview_lines) + ("\n..." if len(preview_paths) > 12 else ""))
+                    except Exception as exc:
+                        st.error(str(exc))
 
         run = st.button(
             "Run batch",
             type="primary",
-            disabled=not subjects,
+            disabled=subject_zip is None,
         )
-        if run and subjects:
+        if run and subject_zip is not None:
+            zip_bytes = subject_zip.getvalue()
+            if len(zip_bytes) > MAX_ZIP_UPLOAD_BYTES:
+                st.error("ZIP exceeds the 200 MB upload limit.")
+                return
+
             with tempfile.TemporaryDirectory() as tmp:
                 tmp_path = Path(tmp)
-                subject_paths = _save_uploads(subjects, tmp_path / "in")
+                input_root = tmp_path / "in"
+                try:
+                    subject_paths = _extract_images_from_zip(zip_bytes, input_root)
+                    _validate_batch_size(len(subject_paths))
+                except Exception as exc:
+                    st.error(str(exc))
+                    return
+
                 donors: Optional[List[Path]] = None
                 if needs_donors:
-                    if not donor_files or len(donor_files) < 2:
-                        st.error("Upload at least 2 donor images for this mode.")
+                    if donor_zip is None:
+                        st.error("Upload a donor ZIP with at least 2 images for this mode.")
                         return
-                    donors = _save_uploads(donor_files, tmp_path / "donors")
+                    donor_bytes = donor_zip.getvalue()
+                    if len(donor_bytes) > MAX_ZIP_UPLOAD_BYTES:
+                        st.error("Donor ZIP exceeds the 200 MB upload limit.")
+                        return
+                    try:
+                        donors = _extract_images_from_zip(donor_bytes, tmp_path / "donors")
+                    except Exception as exc:
+                        st.error(f"Donor ZIP: {exc}")
+                        return
+                    if len(donors) < 2:
+                        st.error("Donor ZIP must contain at least 2 images.")
+                        return
 
                 progress = st.progress(0, text="Starting batch…")
-                with st.spinner(f"Processing {len(subject_paths)} images…"):
+                status = st.empty()
+
+                def _on_progress(current: int, total: int, path: Path) -> None:
+                    rel = _relative_display_path(path, input_root)
+                    progress.progress(current / total, text=f"Processing {current}/{total}: {rel}")
+                    status.caption(f"Current: `{rel}`")
+
+                with st.spinner(f"Processing {len(subject_paths)} images one by one…"):
                     try:
-                        results = run_pipeline(
+                        results = run_pipeline_sequential(
                             mode=mode,
                             input_paths=subject_paths,
                             donor_paths=donors,
                             embed_metadata=embed_metadata,
-                            max_workers=max_workers,
                             replicate_api_key=api_key,
+                            progress_callback=_on_progress,
                         )
                         progress.progress(1.0, text="Batch complete")
+                        status.caption("Done.")
                     except Exception as exc:
                         progress.empty()
+                        status.empty()
                         st.exception(exc)
                         return
 
